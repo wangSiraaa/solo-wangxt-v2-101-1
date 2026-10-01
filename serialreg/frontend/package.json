@@ -1,0 +1,19 @@
+{
+  "name": "serialreg-frontend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "连续出版物登记：期号覆盖与实体位置时间轴",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "vue": "^3.5.13"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.2.1",
+    "vite": "^6.0.7"
+  }
+}
