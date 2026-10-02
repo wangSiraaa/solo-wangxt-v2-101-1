@@ -7,13 +7,19 @@
   Item         馆内实物（一条条码=一个实物，不允许一条条码代表多个合刊期号关系）
   Binding      装订册（多个 Item 装订在一起，拆订后 Item 恢复各自位置）
 
+流通层（事件溯源）：
+  Loan         本地流通单据（一张借出单），状态由 LoanEvent 链物化而来
+  LoanEvent    借/还/遗失事件，仅追加；带幂等标识、单内顺序号与业务发生时间。
+               逾期不入库为事件，而是 Loan 上按 due_at 派生的只读状态。
+
 两条易混的业务规则分开表达：
   缺号 = IssueNumber 没有对应 Issue（没有发行记录），不自动等于缺藏；
   缺藏 = 该编号已发行（存在 Issue），但没有入库 Item 或 Item 丢失。
 """
 from django.db import models
-from django.db.models import Q
+from django.db.models import Q, Prefetch
 from django.core.exceptions import ValidationError
+from django.utils import timezone
 
 
 class Title(models.Model):
@@ -161,8 +167,27 @@ class Item(models.Model):
     def is_bound(self):
         return hasattr(self, "binding_entry")
 
+    @property
+    def has_active_loan(self):
+        """是否存在未结清的借出单（借出中/逾期/借出后报失）。"""
+        prefetched = self.__dict__.get("_prefetched_active_loans", None)
+        if prefetched is not None:
+            return bool(prefetched)
+        return self.loans.filter(status__in=Loan.ACTIVE_STATUSES).exists()
+
+    def active_loan(self):
+        """返回未结清借出单；理论上至多一张。"""
+        prefetched = self.__dict__.get("_prefetched_active_loans", None)
+        if prefetched is not None:
+            return prefetched[0] if prefetched else None
+        return self.loans.filter(status__in=Loan.ACTIVE_STATUSES).first()
+
     def current_location(self):
-        """装订后返回装订册位置，否则返回自身位置。"""
+        """装订后返回装订册位置，否则返回自身位置。
+
+        借出中时自身位置字段不动（仍是归还后要恢复的原架位）；
+        当前保管位置（读者手中）由流通层 circulation_snapshot 表达。
+        """
         entry = getattr(self, "binding_entry", None)
         if entry is not None:
             return entry.binding.location
@@ -211,11 +236,184 @@ class BindingEntry(models.Model):
             raise ValidationError("装订册内的实物必须属于同一种刊。")
 
 
+# 未结清单据状态（类定义体的 Q() 需要模块级常量）
+_ACTIVE_LOAN_STATUSES = ["checked_out", "lost"]
+
+
+class Loan(models.Model):
+    """本地流通单据（借出单）：一张单对应一个实体的一轮借还。
+
+    合刊实物只是一个 Item，所以合刊从任一覆盖期号或条码查到的都是同一张单。
+    单据状态由 LoanEvent 链物化而来；重启后可由 rebuild_loan_state() 重放恢复。
+    """
+
+    class LoanStatus(models.TextChoices):
+        CHECKED_OUT = "checked_out", "借出中"
+        RETURNED = "returned", "已归还"
+        LOST = "lost", "遗失"
+
+    ACTIVE_STATUSES = [LoanStatus.CHECKED_OUT, LoanStatus.LOST]
+
+    item = models.ForeignKey(
+        Item, on_delete=models.PROTECT, related_name="loans",
+    )
+    status = models.CharField(
+        "单据状态", max_length=12,
+        choices=LoanStatus.choices, default=LoanStatus.CHECKED_OUT,
+    )
+    borrower = models.CharField("借阅人", max_length=100, blank=True)
+    checkout_at = models.DateTimeField("借出时刻", null=True, blank=True)
+    due_at = models.DateTimeField("到期时刻", null=True, blank=True)
+    return_at = models.DateTimeField("归还时刻", null=True, blank=True)
+    lost_at = models.DateTimeField("报失时刻", null=True, blank=True)
+    # 借出时封存的架位：归还时必须恢复到同一位置
+    shelf_location = models.CharField("借出时架位", max_length=100, blank=True)
+    version = models.PositiveIntegerField("已应用事件版本", default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-id"]
+        indexes = [
+            models.Index(fields=["item", "status"]),
+        ]
+        constraints = [
+            # 同一实物至多一张未结清单据：防止并发重复借出（PG 约束；
+            # SQLite 测试库也自 3.8 起支持部分唯一索引）
+            models.UniqueConstraint(
+                fields=["item"],
+                condition=Q(status__in=_ACTIVE_LOAN_STATUSES),
+                name="uniq_active_loan_per_item",
+            ),
+        ]
+
+    def __str__(self):
+        return f"Loan#{self.id} {self.item.barcode} [{self.status}]"
+
+    @property
+    def is_active(self):
+        return self.status in self.ACTIVE_STATUSES
+
+    @property
+    def is_overdue(self):
+        """逾期由到期时刻与当前时间派生，不作为事件存储。"""
+        if self.status != self.LoanStatus.CHECKED_OUT or self.due_at is None:
+            return False
+        return timezone.now() > self.due_at
+
+    def derived_status(self, now=None):
+        """读时状态：checked_out / overdue / lost / returned。"""
+        now = now or timezone.now()
+        if self.status == self.LoanStatus.CHECKED_OUT and self.due_at and now > self.due_at:
+            return "overdue"
+        return self.status
+
+
+class LoanEvent(models.Model):
+    """流通事件（仅追加的审计链）。
+
+    - event_id：幂等标识，全局唯一；重复提交同一 event_id 只回放、不再改状态。
+    - seq：单内发生顺序（按到达系统的顺序分配，严格递增）。
+    - occurred_at：业务发生时间（事件所述事实的时刻），可早于 seq 更大的事件——
+      迟到事件若比已应用的最新处置更早，只入链（superseded），不覆盖当前状态。
+    """
+
+    class EventType(models.TextChoices):
+        CHECKOUT = "checkout", "借出"
+        RETURN = "return", "归还"
+        LOST = "lost", "遗失"
+
+    loan = models.ForeignKey(
+        Loan, on_delete=models.PROTECT, related_name="events",
+    )
+    item = models.ForeignKey(
+        Item, on_delete=models.PROTECT, related_name="loan_events",
+    )
+    event_id = models.UUIDField("幂等标识", unique=True, db_index=True)
+    seq = models.PositiveIntegerField("单内顺序")
+    type = models.CharField("事件类型", max_length=10, choices=EventType.choices)
+    occurred_at = models.DateTimeField("业务发生时间")
+    recorded_at = models.DateTimeField("入库时间", auto_now_add=True)
+    actor = models.CharField("操作员", max_length=100, blank=True)
+    note = models.CharField("备注", max_length=255, blank=True)
+    # 借出快照（其余类型留空），用于审计与事件重放
+    borrower = models.CharField("借阅人快照", max_length=100, blank=True)
+    due_at = models.DateTimeField("到期时刻快照", null=True, blank=True)
+    shelf_location = models.CharField("架位快照", max_length=100, blank=True)
+    # 该事件是否真正参与了状态物化（迟到/非法事件只留痕不生效）
+    applied = models.BooleanField("是否已应用", default=True)
+    superseded = models.BooleanField("迟到被覆盖", default=False)
+    reject_reason = models.CharField("未生效原因", max_length=255, blank=True)
+
+    class Meta:
+        ordering = ["loan_id", "seq"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["loan", "seq"], name="uniq_event_seq_per_loan",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.type}#{self.seq} loan={self.loan_id} applied={self.applied}"
+
+
+# 用于 prefetch_related 当前借出单（定位接口、时间轴避免 N+1）
+ACTIVE_LOAN_PREFETCH = Prefetch(
+    "loans",
+    queryset=Loan.objects.filter(status__in=Loan.ACTIVE_STATUSES),
+    to_attr="_prefetched_active_loans",
+)
+
+
+def circulation_snapshot(item, now=None):
+    """实体的实际可得性视图（定位接口与时间轴共用）。
+
+    available    实际可借（在馆、未装订、未借出）
+    bound        已装订（须以装订册整体流通）
+    checked_out  借出中，custody 指向借阅人，带 due_at
+    overdue      借出逾期（checked_out 的派生）
+    lost         遗失（借出后报失或入藏后直接报失）
+    """
+    if item.is_bound:
+        return {
+            "availability": "bound",
+            "active_loan_id": None,
+            "borrower": None,
+            "checkout_at": None,
+            "due_at": None,
+            "custody": f"装订册 {item.binding_entry.binding.call_number}",
+            "custody_kind": "binding",
+            "shelf_location": item.location,
+        }
+    loan = item.active_loan()
+    if loan is not None:
+        derived = loan.derived_status(now=now)
+        return {
+            "availability": derived,
+            "active_loan_id": loan.id,
+            "borrower": loan.borrower,
+            "checkout_at": loan.checkout_at,
+            "due_at": loan.due_at,
+            "custody": f"借阅人：{loan.borrower}" if loan.borrower else "借出（在读者手中）",
+            "custody_kind": "borrower",
+            "shelf_location": item.location,
+        }
+    return {
+        "availability": "lost" if item.status == Item.ItemStatus.LOST else "available",
+        "active_loan_id": None,
+        "borrower": None,
+        "checkout_at": None,
+        "due_at": None,
+        "custody": item.current_location(),
+        "custody_kind": "shelf",
+        "shelf_location": item.location,
+    }
+
+
 def number_holding_status(title, number):
     """计算某个期号的馆藏视图状态。
 
-    issued+held       已发行且有在馆实物（含装订）
-    issued+missing    已发行但缺藏（无实物或全部丢失/借出按调用方再细分）
+    issued+held       已发行且有在馆实物（含装订；借出中的实物仍属馆藏）
+    issued+missing    已发行但缺藏（无实物或全部丢失）
     not_published     缺号：没有任何发行记录，不自动等同缺藏
     ceased_gap        停刊后出现的编号（永远不会有发行）
     """
@@ -231,10 +429,13 @@ def number_holding_status(title, number):
 
 
 def locate_number(number):
-    """从任一期号找到其所在实物与实际位置（合刊、装订都可命中）。"""
+    """从任一期号找到其所在实物与实际位置（合刊、装订、借出都可命中）。"""
     rows = []
     for issue in number.issues.all():
-        for item in issue.items.select_related("title"):
+        for item in issue.items.select_related(
+            "title", "binding_entry__binding",
+        ).prefetch_related(ACTIVE_LOAN_PREFETCH):
+            snap = circulation_snapshot(item)
             rows.append({
                 "issue_id": issue.id,
                 "barcode": item.barcode,
@@ -242,5 +443,13 @@ def locate_number(number):
                 "location": item.current_location(),
                 "bound": item.is_bound,
                 "binding": item.binding_entry.binding.call_number if item.is_bound else None,
+                # 实际可得性 / 当前保管位置 / 到期日
+                "availability": snap["availability"],
+                "custody": snap["custody"],
+                "custody_kind": snap["custody_kind"],
+                "active_loan_id": snap["active_loan_id"],
+                "borrower": snap["borrower"],
+                "due_at": snap["due_at"],
+                "checkout_at": snap["checkout_at"],
             })
     return rows

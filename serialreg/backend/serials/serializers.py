@@ -2,7 +2,8 @@ from django.db import transaction
 from rest_framework import serializers
 
 from .models import (
-    Binding, BindingEntry, Issue, IssueNumber, IssueNumbering, Item, Title,
+    Binding, BindingEntry, Issue, IssueNumber, IssueNumbering, Item,
+    Loan, LoanEvent, Title,
 )
 
 
@@ -147,12 +148,28 @@ class ItemSerializer(serializers.ModelSerializer):
         read_only_fields: list = []
 
     def validate_status(self, value):
-        # status 可经 PATCH 修改（报失/找回）；bound 只能由装订/拆订流程设置
+        # bound 只能由装订/拆订流程设置
         if value == Item.ItemStatus.BOUND:
             raise serializers.ValidationError(
                 "已装订状态只能通过装订/拆订操作变更。",
             )
         return value
+
+    def validate(self, attrs):
+        title = attrs.get("title", getattr(self.instance, "title", None))
+        issue = attrs.get("issue", getattr(self.instance, "issue", None))
+        if issue and title and issue.title_id != title.id:
+            raise serializers.ValidationError("实物所属刊与发行期不一致。")
+        # 借出中的实体：状态只能由流通事件链（归还/遗失）改变，
+        # 不允许用普通 PATCH 绕过借还流程
+        if self.instance is not None and attrs.get("status"):
+            if self.instance.loans.filter(
+                status=Loan.LoanStatus.CHECKED_OUT,
+            ).exists():
+                raise serializers.ValidationError(
+                    "实体处于借出中，请通过归还/遗失流通事件变更状态。",
+                )
+        return attrs
 
     def get_current_location(self, obj):
         return obj.current_location()
@@ -165,13 +182,6 @@ class ItemSerializer(serializers.ModelSerializer):
 
     def get_number_ids(self, obj):
         return list(obj.issue.numbers.values_list("id", flat=True))
-
-    def validate(self, attrs):
-        title = attrs.get("title", getattr(self.instance, "title", None))
-        issue = attrs.get("issue", getattr(self.instance, "issue", None))
-        if issue and title and issue.title_id != title.id:
-            raise serializers.ValidationError("实物所属刊与发行期不一致。")
-        return attrs
 
 
 class BindingSerializer(serializers.ModelSerializer):
@@ -206,6 +216,21 @@ class BindingSerializer(serializers.ModelSerializer):
         if already:
             raise serializers.ValidationError(
                 f"实物已在装订册中：{already}，请先拆订。",
+            )
+        # 借出中的实体（含借出后报失、有未结清借出单）不能装订：
+        # 装订关系不得被借阅流程破坏，实物须先归还结清
+        on_loan = [
+            it.barcode for it in deduped
+            if it.loans.filter(status__in=Loan.ACTIVE_STATUSES).exists()
+        ]
+        if on_loan:
+            raise serializers.ValidationError(
+                f"实物处于借出流程中，不能装订：{on_loan}，请先归还。",
+            )
+        lost = [it.barcode for it in deduped if it.status == Item.ItemStatus.LOST]
+        if lost:
+            raise serializers.ValidationError(
+                f"实物已遗失，不能装订：{lost}。",
             )
         return deduped
 
@@ -252,3 +277,89 @@ class UnbindSerializer(serializers.Serializer):
         BindingEntry.objects.filter(binding=binding).delete()
         binding.delete()
         return [e.item for e in entries]
+
+
+# ---------- 流通 ----------
+
+class FlexibleDateTimeField(serializers.DateTimeField):
+    """到期/发生时间：既接受 ISO 时间，也接受 'YYYY-MM-DD'（按当日 00:00）。"""
+
+    def to_internal_value(self, value):
+        if isinstance(value, str) and len(value) == 10 and value[4] == "-":
+            value = f"{value}T00:00:00"
+        return super().to_internal_value(value)
+
+
+class CheckoutSerializer(serializers.Serializer):
+    item = serializers.PrimaryKeyRelatedField(
+        queryset=Item.objects.all(), required=False,
+    )
+    barcode = serializers.CharField(required=False)
+    borrower = serializers.CharField(required=False, allow_blank=True, default="")
+    due_at = FlexibleDateTimeField()
+    occurred_at = FlexibleDateTimeField(required=False)
+    event_id = serializers.UUIDField(required=False)
+    actor = serializers.CharField(required=False, allow_blank=True, default="")
+    note = serializers.CharField(required=False, allow_blank=True, default="")
+
+    def validate(self, attrs):
+        if not attrs.get("item") and not attrs.get("barcode"):
+            raise serializers.ValidationError("需要提供 item 或 barcode。")
+        return attrs
+
+
+class LoanEventPostSerializer(serializers.Serializer):
+    """归还 / 遗失事件提交：任一实体定位方式 + 幂等标识 + 业务发生时间。"""
+
+    loan = serializers.PrimaryKeyRelatedField(
+        queryset=Loan.objects.all(), required=False,
+    )
+    item = serializers.PrimaryKeyRelatedField(
+        queryset=Item.objects.all(), required=False,
+    )
+    barcode = serializers.CharField(required=False)
+    occurred_at = FlexibleDateTimeField(required=False)
+    event_id = serializers.UUIDField(required=False)
+    actor = serializers.CharField(required=False, allow_blank=True, default="")
+    note = serializers.CharField(required=False, allow_blank=True, default="")
+
+    def validate(self, attrs):
+        if not (attrs.get("loan") or attrs.get("item") or attrs.get("barcode")):
+            raise serializers.ValidationError(
+                "需要提供 loan、item 或 barcode。",
+            )
+        return attrs
+
+
+class LoanEventSerializer(serializers.ModelSerializer):
+    type_display = serializers.CharField(source="get_type_display", read_only=True)
+
+    class Meta:
+        model = LoanEvent
+        fields = [
+            "id", "event_id", "seq", "type", "type_display",
+            "occurred_at", "recorded_at", "actor", "note",
+            "borrower", "due_at", "shelf_location",
+            "applied", "superseded", "reject_reason",
+        ]
+
+
+class LoanSerializer(serializers.ModelSerializer):
+    events = LoanEventSerializer(many=True, read_only=True)
+    derived_status = serializers.SerializerMethodField()
+    overdue = serializers.SerializerMethodField()
+    barcode = serializers.CharField(source="item.barcode", read_only=True)
+
+    class Meta:
+        model = Loan
+        fields = [
+            "id", "item", "barcode", "status", "derived_status", "overdue",
+            "borrower", "checkout_at", "due_at", "return_at", "lost_at",
+            "shelf_location", "version", "created_at", "events",
+        ]
+
+    def get_derived_status(self, obj):
+        return obj.derived_status()
+
+    def get_overdue(self, obj):
+        return obj.is_overdue

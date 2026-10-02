@@ -1,15 +1,20 @@
-from django.db.models import Exists, OuterRef, Prefetch
+from django.db.models import Prefetch
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
 
+from . import circulation
+from .circulation import CirculationError
 from .models import (
-    Binding, Issue, IssueNumber, IssueNumbering, Item, Title,
+    Binding, Issue, IssueNumber, IssueNumbering, Item,
+    Loan, LoanEvent, Title,
+    ACTIVE_LOAN_PREFETCH, circulation_snapshot,
     locate_number, number_holding_status,
 )
 from .serializers import (
-    BindingSerializer, IssueSerializer, ItemSerializer,
-    IssueNumberSerializer, TitleSerializer, UnbindSerializer,
+    BindingSerializer, CheckoutSerializer, IssueSerializer, ItemSerializer,
+    IssueNumberSerializer, LoanEventPostSerializer, LoanEventSerializer,
+    LoanSerializer, TitleSerializer, UnbindSerializer,
 )
 
 
@@ -47,14 +52,15 @@ class IssueViewSet(viewsets.ModelViewSet):
 class ItemViewSet(viewsets.ModelViewSet):
     queryset = Item.objects.select_related(
         "title", "issue", "binding_entry__binding",
-    ).prefetch_related("issue__numbers")
+    ).prefetch_related("issue__numbers", ACTIVE_LOAN_PREFETCH)
     serializer_class = ItemSerializer
 
     @action(detail=False, methods=["get"])
     def locate(self, request):
         """按 (title, volume, number) 或 barcode 定位实物。
 
-        合刊的任一期号都必须能找到同一实物；装订后返回装订册位置。
+        合刊的任一期号都必须能找到同一实物；装订后返回装订册位置；
+        借出中返回实际可得性、到期日与当前保管位置（借阅人）。
         """
         title_id = request.query_params.get("title")
         volume = request.query_params.get("volume", "")
@@ -65,6 +71,7 @@ class ItemViewSet(viewsets.ModelViewSet):
             items = self.get_queryset().filter(barcode=barcode)
             result = []
             for it in items:
+                snap = circulation_snapshot(it)
                 result.append({
                     "barcode": it.barcode,
                     "issue_id": it.issue_id,
@@ -77,6 +84,13 @@ class ItemViewSet(viewsets.ModelViewSet):
                     "binding": it.binding_entry.binding.call_number
                     if it.is_bound else None,
                     "status": it.status,
+                    "availability": snap["availability"],
+                    "custody": snap["custody"],
+                    "custody_kind": snap["custody_kind"],
+                    "active_loan_id": snap["active_loan_id"],
+                    "borrower": snap["borrower"],
+                    "checkout_at": snap["checkout_at"],
+                    "due_at": snap["due_at"],
                 })
             return Response({"query": {"barcode": barcode}, "matches": result})
 
@@ -141,6 +155,116 @@ class BindingViewSet(viewsets.ModelViewSet):
         })
 
 
+class LoanViewSet(viewsets.ReadOnlyModelViewSet):
+    """流通单据（借出单）及其事件链。写操作走 checkout/return/lost 动作。"""
+
+    queryset = (
+        Loan.objects.select_related("item")
+        .prefetch_related("events")
+    )
+    serializer_class = LoanSerializer
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        params = self.request.query_params
+        if params.get("item"):
+            qs = qs.filter(item_id=params["item"])
+        if params.get("barcode"):
+            qs = qs.filter(item__barcode=params["barcode"])
+        if params.get("title"):
+            qs = qs.filter(item__title_id=params["title"])
+        if params.get("active") in ("1", "true", "yes"):
+            qs = qs.filter(status__in=Loan.ACTIVE_STATUSES)
+        return qs
+
+    def _dispatch(self, request, event_type=None):
+        """checkout / return / lost 的公共入口，统一映射业务异常。"""
+        if event_type is None:  # checkout
+            serializer = CheckoutSerializer(data=request.data)
+        else:
+            serializer = LoanEventPostSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        try:
+            if event_type is None:
+                result = circulation.checkout(
+                    item_id=getattr(data.get("item"), "id", None),
+                    barcode=data.get("barcode"),
+                    borrower=data.get("borrower", ""),
+                    due_at=data["due_at"],
+                    occurred_at=data.get("occurred_at"),
+                    event_id=str(data["event_id"]) if data.get("event_id") else None,
+                    actor=data.get("actor", ""),
+                    note=data.get("note", ""),
+                )
+            else:
+                result = circulation.apply_event(
+                    event_type,
+                    loan_id=getattr(data.get("loan"), "id", None),
+                    item_id=getattr(data.get("item"), "id", None),
+                    barcode=data.get("barcode"),
+                    occurred_at=data.get("occurred_at"),
+                    event_id=str(data["event_id"]) if data.get("event_id") else None,
+                    actor=data.get("actor", ""),
+                    note=data.get("note", ""),
+                )
+        except CirculationError as exc:
+            code_map = {
+                "not_found": status.HTTP_404_NOT_FOUND,
+                "bad_request": status.HTTP_400_BAD_REQUEST,
+            }
+            http_status = code_map.get(
+                exc.code, status.HTTP_409_CONFLICT,
+            )
+            return Response(
+                {"detail": exc.detail, "code": exc.code},
+                status=http_status,
+            )
+        body = LoanSerializer(result["loan"]).data
+        body["event_result"] = {
+            "replayed": result["replayed"],
+            "applied": result["applied"],
+            "superseded": result["superseded"],
+            "rejected": result["rejected"],
+            "event_id": str(result["event"].event_id),
+            "seq": result["event"].seq,
+            "reject_reason": result["event"].reject_reason,
+        }
+        return Response(body, status=status.HTTP_201_CREATED)
+
+    @action(detail=False, methods=["post"])
+    def checkout(self, request):
+        return self._dispatch(request)
+
+    @action(detail=False, methods=["post"])
+    def return_item(self, request):
+        return self._dispatch(request, LoanEvent.EventType.RETURN)
+
+    @action(detail=False, methods=["post"])
+    def lost(self, request):
+        return self._dispatch(request, LoanEvent.EventType.LOST)
+
+    @action(detail=True, methods=["get"])
+    def events(self, request, pk=None):
+        """单张借出单的完整事件链（含只留痕的迟到/非法事件）。"""
+        loan = self.get_object()
+        events = loan.events.all()
+        return Response({
+            "loan": loan.id,
+            "status": loan.status,
+            "derived_status": loan.derived_status(),
+            "events": LoanEventSerializer(events, many=True).data,
+        })
+
+    @action(detail=True, methods=["post"])
+    def rebuild(self, request, pk=None):
+        """按事件链重放物化当前状态（模拟刷新/重启后的恢复）。"""
+        loan = self.get_object()
+        circulation.rebuild_loan_state(loan=loan)
+        loan.refresh_from_db()
+        return Response(LoanSerializer(loan).data)
+
+
 class TimelineViewSet(viewsets.ViewSet):
     """前端时间轴数据源：编号 × 发行 × 实物三层，外加停刊标记。"""
 
@@ -166,7 +290,7 @@ class TimelineViewSet(viewsets.ViewSet):
                             "items",
                             queryset=Item.objects.select_related(
                                 "binding_entry__binding",
-                            ),
+                            ).prefetch_related(ACTIVE_LOAN_PREFETCH),
                         ),
                     ),
                 ),
@@ -197,15 +321,7 @@ class TimelineViewSet(viewsets.ViewSet):
                             for nn in iss.numberings.all()
                         ],
                         "items": [
-                            {
-                                "item_id": it.id,
-                                "barcode": it.barcode,
-                                "status": it.status,
-                                "location": it.current_location(),
-                                "bound": it.is_bound,
-                                "binding": it.binding_entry.binding.call_number
-                                if it.is_bound else None,
-                            }
+                            self._item_payload(it)
                             for it in iss.items.all()
                         ],
                     }
@@ -216,3 +332,24 @@ class TimelineViewSet(viewsets.ViewSet):
             "title": TitleSerializer(title).data,
             "slots": slots,
         })
+
+    @staticmethod
+    def _item_payload(it):
+        snap = circulation_snapshot(it)
+        return {
+            "item_id": it.id,
+            "barcode": it.barcode,
+            "status": it.status,
+            "location": it.current_location(),
+            "bound": it.is_bound,
+            "binding": it.binding_entry.binding.call_number
+            if it.is_bound else None,
+            # 流通层：实际可得性 / 当前保管位置 / 到期日
+            "availability": snap["availability"],
+            "custody": snap["custody"],
+            "custody_kind": snap["custody_kind"],
+            "active_loan_id": snap["active_loan_id"],
+            "borrower": snap["borrower"],
+            "checkout_at": snap["checkout_at"],
+            "due_at": snap["due_at"],
+        }

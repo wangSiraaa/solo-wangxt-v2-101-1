@@ -168,3 +168,18 @@ button.tiny { padding: 3px 9px; font-size: 12px; }
   margin-top: 8px; border-top: 1px dashed var(--line); padding-top: 8px;
 }
 code { background: #eef1f5; padding: 0 4px; border-radius: 4px; font-size: 12px; }
+
+/* ---------- 流通 ---------- */
+.badge.out { background: #e8f0fe; color: #1a56c4; }
+.badge.bound { background: #f3eaff; color: #6d28d9; }
+button.tiny.ok { color: var(--ok); border-color: var(--ok); }
+button.tiny.danger { color: var(--missing); border-color: var(--missing); }
+.due { font-size: 12px; color: #555; margin-left: 6px; }
+.overdue-text { color: var(--missing); font-weight: 600; font-size: 12px; }
+.loan-ref { font-size: 11px; color: #888; margin-left: 4px; }
+.circ { display: inline-flex; gap: 4px; align-items: center; flex-wrap: wrap; }
+.checkout-inline { display: inline-flex; gap: 4px; align-items: center; }
+.tiny-input {
+  padding: 2px 6px; font-size: 12px; border: 1px solid #ccc;
+  border-radius: 4px; width: 110px;
+}

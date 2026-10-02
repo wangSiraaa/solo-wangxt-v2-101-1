@@ -27,4 +27,22 @@ export const ITEM_STATUS = {
   bound: "已装订",
 };
 
+// 实际可得性（流通派生视图，比 item.status 更细：逾期不入库，读时派生）
+export const AVAILABILITY = {
+  available: { label: "可借", cls: "ok", hint: "在馆，可借出" },
+  checked_out: { label: "借出中", cls: "out", hint: "在读者手中，到期日前归还" },
+  overdue: { label: "逾期", cls: "missing", hint: "已超过到期日" },
+  lost: { label: "遗失", cls: "missing", hint: "实物遗失，缺藏" },
+  bound: { label: "已装订", cls: "bound", hint: "装订册整体保管，不能单件外借" },
+};
+
+export const LOAN_STATUS = {
+  checked_out: "借出中",
+  returned: "已归还",
+  lost: "遗失",
+};
+
+export const fmtDT = (s) => (s ? s.replace("T", " ").slice(0, 16) : "—");
+export const fmtDay = (s) => (s ? s.slice(0, 10) : "—");
+
 export const ISSUE_KIND = { regular: "普通期", combined: "两期合刊" };

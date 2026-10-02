@@ -1,11 +1,14 @@
 """装入验证样例：跨年卷、停刊月份、两期合刊，以及一次装订/拆订演示。"""
-from datetime import date
+from datetime import date, timedelta
 
 from django.core.management.base import BaseCommand
 from django.db import transaction
+from django.utils import timezone
 
+from serials.circulation import checkout
 from serials.models import (
-    Binding, BindingEntry, Issue, IssueNumber, IssueNumbering, Item, Title,
+    Binding, BindingEntry, Issue, IssueNumber, IssueNumbering, Item,
+    Loan, Title,
 )
 
 
@@ -83,6 +86,22 @@ class Command(BaseCommand):
             self.stdout.write(self.style.SUCCESS(
                 "✓ 装订册 Q/SY-2024：SY-8-34 + SY-8-5 → 装订库 C-12；"
                 "可调用 /api/bindings/unbind/ 拆订恢复原位置"))
+
+        # 5) 本地流通演示：跨年卷 no.1 借出（带幂等 event_id，可安全重复执行）
+        nj_item = Item.objects.get(barcode="NJ-60-1")
+        if not nj_item.loans.filter(status__in=Loan.ACTIVE_STATUSES).exists():
+            checkout(
+                item_id=nj_item.id, borrower="陈馆员代借·读者甲",
+                due_at=timezone.now() + timedelta(days=14),
+                # 固定幂等标识：重复 seed 不会产生第二张借出单
+                event_id="00000000-0000-4000-8000-000000000001",
+                actor="seed_sample", note="样例借出（14 天到期）",
+            )
+            self.stdout.write(self.style.SUCCESS(
+                "✓ 流通演示：NJ-60-1 已借出；从条码或 v.60 no.1 定位"
+                "都显示同一张借出单与到期日"))
+        else:
+            self.stdout.write("✓ 流通演示：NJ-60-1 已有未结清借出单，跳过")
 
     def _number(self, title, volume, number, sort_key):
         obj, _ = IssueNumber.objects.get_or_create(

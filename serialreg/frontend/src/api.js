@@ -60,4 +60,28 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ binding_id: bindingId }),
     }),
+
+  // ---------- 本地流通 ----------
+  listLoans: (params = {}) => {
+    const qs = new URLSearchParams(
+      Object.entries(params).filter(([, v]) => v !== "" && v != null),
+    ).toString();
+    return request(`/loans/${qs ? `?${qs}` : ""}`);
+  },
+  loanEvents: (loanId) => request(`/loans/${loanId}/events/`),
+  checkout: (payload) =>
+    request("/loans/checkout/", {
+      method: "POST",
+      body: JSON.stringify({ event_id: crypto.randomUUID(), ...payload }),
+    }),
+  returnLoan: (payload) =>
+    request("/loans/return_item/", {
+      method: "POST",
+      body: JSON.stringify({ event_id: crypto.randomUUID(), ...payload }),
+    }),
+  reportLoanLost: (payload) =>
+    request("/loans/lost/", {
+      method: "POST",
+      body: JSON.stringify({ event_id: crypto.randomUUID(), ...payload }),
+    }),
 };

@@ -56,19 +56,37 @@
 
             <div v-for="it in iss.items" :key="it.barcode" class="item-line">
               <code>{{ it.barcode }}</code>
-              <span class="badge" :class="it.status === 'lost' ? 'missing' : 'ok'">
-                {{ itemStatus[it.status] || it.status }}
+              <span class="badge" :class="availMeta(it.availability).cls">
+                {{ availMeta(it.availability).label }}
               </span>
               <span class="loc">
-                📍 {{ it.location || "（未排架）" }}
-                <template v-if="it.bound">（装订册 {{ it.binding }}）</template>
+                <!-- 借出中：当前保管位置是借阅人；架位保留为归还位置 -->
+                <template v-if="it.custody_kind === 'borrower'">
+                  🙋 {{ it.custody }}
+                  <span class="due">
+                    到期 {{ fmtDay(it.due_at) }}
+                    <b v-if="it.availability === 'overdue'" class="overdue-text">（已逾期）</b>
+                  </span>
+                  <br /><span class="muted">归还架位：{{ it.location || "（未排架）" }}</span>
+                </template>
+                <template v-else>
+                  📍 {{ it.location || "（未排架）" }}
+                  <template v-if="it.bound">（装订册 {{ it.binding }}）</template>
+                </template>
               </span>
+              <CirculationActions
+                :barcode="it.barcode"
+                :availability="it.availability"
+                :loan-id="it.active_loan_id"
+                @changed="$emit('changed')"
+                @notice="(n) => $emit('notice', n)"
+              />
               <button
-                v-if="!it.bound && it.status !== 'lost'"
+                v-if="!it.bound && !it.active_loan_id && it.status !== 'lost'"
                 class="tiny ghost"
                 @click="$emit('mark-lost', it.item_id)"
-                title="标记丢失后，该期变为缺藏"
-              >报失</button>
+                title="未入流通时直接标记丢失（缺藏）"
+              >直接报失</button>
             </div>
           </div>
         </div>
@@ -78,11 +96,15 @@
 </template>
 
 <script setup>
-import { HOLDING_STATUS, ITEM_STATUS } from "../status.js";
+import { HOLDING_STATUS, AVAILABILITY, fmtDay } from "../status.js";
+import CirculationActions from "./CirculationActions.vue";
 
 defineProps({ data: Object });
-defineEmits(["mark-lost"]);
-const itemStatus = ITEM_STATUS;
+const emit = defineEmits(["mark-lost", "changed", "notice"]);
+
+function availMeta(a) {
+  return AVAILABILITY[a] || { label: a || "未知", cls: "gap", hint: "" };
+}
 
 const isGap = (s) => s === "not_published" || s === "ceased_gap";
 

@@ -3,7 +3,7 @@ from rest_framework.routers import DefaultRouter
 
 from .views import (
     BindingViewSet, IssueNumberViewSet, IssueViewSet, ItemViewSet,
-    TimelineViewSet, TitleViewSet,
+    LoanViewSet, TimelineViewSet, TitleViewSet,
 )
 
 router = DefaultRouter()
@@ -12,6 +12,7 @@ router.register("numbers", IssueNumberViewSet)
 router.register("issues", IssueViewSet)
 router.register("items", ItemViewSet, basename="item")
 router.register("bindings", BindingViewSet)
+router.register("loans", LoanViewSet, basename="loan")
 router.register("timeline", TimelineViewSet, basename="timeline")
 
 urlpatterns = [

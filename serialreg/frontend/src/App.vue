@@ -56,7 +56,15 @@
 
         <div style="display:flex;gap:16px;align-items:flex-start;flex-wrap:wrap">
           <div style="flex:2;min-width:420px">
-            <TimelineView :data="timeline" @mark-lost="markLost" />
+            <p v-if="circMsg" class="msg" :class="circMsg.err ? 'err' : 'ok'">
+              {{ circMsg.text }}
+            </p>
+            <TimelineView
+              :data="timeline"
+              @mark-lost="markLost"
+              @changed="refresh"
+              @notice="onCircNotice"
+            />
           </div>
           <div style="flex:1;min-width:340px">
             <RegisterForms
@@ -90,6 +98,12 @@ const currentId = ref(null);
 const timeline = ref(null);
 const showNewTitle = ref(false);
 const titleMsg = ref(null);
+const circMsg = ref(null);
+
+function onCircNotice(n) {
+  circMsg.value = n;
+  setTimeout(() => (circMsg.value = null), 5000);
+}
 
 const nt = ref({ title: "", issn: "", status: "active", ceased_month: "" });
 
