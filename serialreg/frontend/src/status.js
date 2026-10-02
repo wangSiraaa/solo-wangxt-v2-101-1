@@ -27,4 +27,24 @@ export const ITEM_STATUS = {
   bound: "已装订",
 };
 
+// 实际可得性（定位/时间轴联动显示）
+export const AVAILABILITY = {
+  available: { label: "可借", cls: "ok" },
+  on_loan: { label: "借出中", cls: "loaned" },
+  bound: { label: "已装订", cls: "combined" },
+  lost: { label: "丢失", cls: "missing" },
+};
+
+export const LOAN_EVENT = {
+  checkout: "借出",
+  return: "归还",
+  overdue: "逾期",
+  lost: "遗失",
+};
+
+export const LOAN_STATUS = {
+  open: "在借",
+  closed: "已关闭",
+};
+
 export const ISSUE_KIND = { regular: "普通期", combined: "两期合刊" };

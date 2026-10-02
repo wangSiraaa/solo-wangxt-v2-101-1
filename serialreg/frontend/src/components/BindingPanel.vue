@@ -16,14 +16,14 @@
     </div>
 
     <div class="checks" style="margin-top:8px">
-      <span class="muted">仅可勾选同一种刊中<b>未装订</b>的实物：</span><br />
+      <span class="muted">仅可勾选同一种刊中<b>未装订且在馆</b>的实物（借出中须先归还）：</span><br />
       <label v-for="it in unboundItems" :key="it.barcode">
         <input type="checkbox" :value="it.item_pk" v-model="picked" />
         <code>{{ it.barcode }}</code>
         <span class="loc">{{ it.location || "（未排架）" }}</span>
       </label>
       <span v-if="unboundItems.length === 0" class="muted">
-        （暂无可装订实物；已装订实物必须先拆订）
+        （暂无可装订实物；已装订实物必须先拆订，借出中实物须先归还）
       </span>
     </div>
     <p class="muted" style="margin-top:6px">
@@ -75,7 +75,7 @@ function notify(text, err = false) {
   setTimeout(() => (msg.value = null), 4000);
 }
 
-// 从时间轴扁平出未装订实物。合刊实物会挂在多个期号槽位下，必须按主键去重。
+// 从时间轴扁平出可装订实物（未装订且在馆）。合刊实物会挂在多个期号槽位下，必须按主键去重。
 const unboundItems = computed(() => {
   const seen = new Set();
   const out = [];
@@ -83,6 +83,7 @@ const unboundItems = computed(() => {
     for (const iss of s.issues) {
       for (const it of iss.items) {
         if (it.bound) continue;
+        if (it.availability && it.availability !== "available") continue; // 借出中不可装订
         const pk = it.item_id ?? it.barcode;
         if (seen.has(pk)) continue; // 合刊：同一实物只列一次
         seen.add(pk);

@@ -2,7 +2,8 @@ from django.db import transaction
 from rest_framework import serializers
 
 from .models import (
-    Binding, BindingEntry, Issue, IssueNumber, IssueNumbering, Item, Title,
+    Binding, BindingEntry, CirculationEvent, Issue, IssueNumber,
+    IssueNumbering, Item, Loan, Title, circulation_info,
 )
 
 
@@ -130,19 +131,21 @@ class IssueSerializer(serializers.ModelSerializer):
 
 
 class ItemSerializer(serializers.ModelSerializer):
-    """入藏实物。current_location 在装订后取装订册位置。"""
+    """入藏实物。current_location 在装订/借出后取装订册或流通保管位置。"""
 
     current_location = serializers.SerializerMethodField()
     bound = serializers.SerializerMethodField()
     binding_call_number = serializers.SerializerMethodField()
     number_ids = serializers.SerializerMethodField()
+    availability = serializers.SerializerMethodField()
+    circulation = serializers.SerializerMethodField()
 
     class Meta:
         model = Item
         fields = [
             "id", "barcode", "title", "issue", "location", "status",
             "accessioned_at", "current_location", "bound",
-            "binding_call_number", "number_ids",
+            "binding_call_number", "number_ids", "availability", "circulation",
         ]
         read_only_fields: list = []
 
@@ -166,11 +169,25 @@ class ItemSerializer(serializers.ModelSerializer):
     def get_number_ids(self, obj):
         return list(obj.issue.numbers.values_list("id", flat=True))
 
+    def get_availability(self, obj):
+        return obj.availability()
+
+    def get_circulation(self, obj):
+        return circulation_info(obj)
+
     def validate(self, attrs):
         title = attrs.get("title", getattr(self.instance, "title", None))
         issue = attrs.get("issue", getattr(self.instance, "issue", None))
         if issue and title and issue.title_id != title.id:
             raise serializers.ValidationError("实物所属刊与发行期不一致。")
+        # 有未关闭流通单的实物，状态只能由流通事件（归还/遗失）驱动
+        if (
+            self.instance is not None and "status" in attrs
+            and self.instance.active_loan() is not None
+        ):
+            raise serializers.ValidationError(
+                {"status": "该实物有未关闭的流通单，请通过归还/遗失事件变更状态。"},
+            )
         return attrs
 
 
@@ -206,6 +223,15 @@ class BindingSerializer(serializers.ModelSerializer):
         if already:
             raise serializers.ValidationError(
                 f"实物已在装订册中：{already}，请先拆订。",
+            )
+        # 借出中的实体不能被装订，须先归还
+        on_loan = [
+            it.barcode for it in deduped
+            if it.status == Item.ItemStatus.CHECKED_OUT
+        ]
+        if on_loan:
+            raise serializers.ValidationError(
+                f"实物借出中，不能装订，请先归还：{on_loan}",
             )
         return deduped
 
@@ -252,3 +278,83 @@ class UnbindSerializer(serializers.Serializer):
         BindingEntry.objects.filter(binding=binding).delete()
         binding.delete()
         return [e.item for e in entries]
+
+
+# ---------- 本地流通 ----------
+
+
+class CirculationEventSerializer(serializers.ModelSerializer):
+    """流通事件（审计链节点）。"""
+
+    class Meta:
+        model = CirculationEvent
+        fields = [
+            "id", "loan", "event_type", "idempotency_key", "occurred_at",
+            "seq", "applied", "note", "created_at",
+        ]
+
+
+class LoanSerializer(serializers.ModelSerializer):
+    """流通单据，含完整事件链。"""
+
+    barcode = serializers.CharField(source="item.barcode", read_only=True)
+    title = serializers.IntegerField(source="item.title_id", read_only=True)
+    overdue = serializers.SerializerMethodField()
+    events = CirculationEventSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = Loan
+        fields = [
+            "id", "item", "barcode", "title", "status", "close_reason",
+            "due_date", "custody_location", "is_overdue", "overdue",
+            "checked_out_at", "closed_at", "idempotency_key", "last_seq",
+            "events", "created_at",
+        ]
+
+    def get_overdue(self, obj):
+        return obj.overdue()
+
+
+class CheckoutSerializer(serializers.Serializer):
+    """开单（借出）入参：item 或 barcode 二选一，幂等标识必填。"""
+
+    item = serializers.PrimaryKeyRelatedField(
+        queryset=Item.objects.all(), required=False,
+    )
+    barcode = serializers.CharField(required=False)
+    due_date = serializers.DateField()
+    custody_location = serializers.CharField(
+        required=False, allow_blank=True, default="",
+    )
+    idempotency_key = serializers.CharField(max_length=64)
+    occurred_at = serializers.DateTimeField(required=False)
+
+    def validate(self, attrs):
+        item = attrs.get("item")
+        barcode = attrs.pop("barcode", "") or ""
+        if item is None and not barcode:
+            raise serializers.ValidationError("需要提供 item 或 barcode。")
+        if item is None:
+            try:
+                item = Item.objects.get(barcode=barcode)
+            except Item.DoesNotExist:
+                raise serializers.ValidationError(
+                    {"barcode": f"条码 {barcode} 不存在。"},
+                )
+        attrs["item"] = item
+        return attrs
+
+
+class LoanEventSerializer(serializers.Serializer):
+    """追加流通事件（归还/逾期/遗失）入参。"""
+
+    event_type = serializers.ChoiceField(
+        choices=[
+            CirculationEvent.EventType.RETURN,
+            CirculationEvent.EventType.OVERDUE,
+            CirculationEvent.EventType.LOST,
+        ],
+    )
+    idempotency_key = serializers.CharField(max_length=64)
+    occurred_at = serializers.DateTimeField(required=False)
+    note = serializers.CharField(required=False, allow_blank=True, default="")

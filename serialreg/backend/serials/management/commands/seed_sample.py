@@ -1,11 +1,14 @@
-"""装入验证样例：跨年卷、停刊月份、两期合刊，以及一次装订/拆订演示。"""
-from datetime import date
+"""装入验证样例：跨年卷、停刊月份、两期合刊，以及一次装订/拆订与流通演示。"""
+from datetime import date, timedelta
 
 from django.core.management.base import BaseCommand
 from django.db import transaction
+from django.utils import timezone
 
+from serials.circulation import checkout_item
 from serials.models import (
-    Binding, BindingEntry, Issue, IssueNumber, IssueNumbering, Item, Title,
+    Binding, BindingEntry, Issue, IssueNumber, IssueNumbering, Item, Loan,
+    Title,
 )
 
 
@@ -83,6 +86,18 @@ class Command(BaseCommand):
             self.stdout.write(self.style.SUCCESS(
                 "✓ 装订册 Q/SY-2024：SY-8-34 + SY-8-5 → 装订库 C-12；"
                 "可调用 /api/bindings/unbind/ 拆订恢复原位置"))
+
+        # 5) 流通演示：借出 NJ-60-1（幂等键固定，重复执行不会产生第二单）
+        loan, replayed = checkout_item(
+            item=Item.objects.get(barcode="NJ-60-1"),
+            idempotency_key="seed-loan-NJ-60-1",
+            due_date=timezone.localdate() + timedelta(days=14),
+            custody_location="流通台",
+        )
+        if not replayed:
+            self.stdout.write(self.style.SUCCESS(
+                f"✓ 流通单 #{loan.id}：NJ-60-1 借出，"
+                f"到期 {loan.due_date}，保管于 {loan.custody_location}"))
 
     def _number(self, title, volume, number, sort_key):
         obj, _ = IssueNumber.objects.get_or_create(

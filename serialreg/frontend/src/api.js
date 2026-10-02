@@ -60,4 +60,19 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ binding_id: bindingId }),
     }),
+
+  // 本地流通：开单 / 事件（归还·逾期·遗失）/ 事件链
+  listLoans: (params = {}) => {
+    const qs = new URLSearchParams(
+      Object.entries(params).filter(([, v]) => v !== "" && v != null),
+    ).toString();
+    return request(`/loans/${qs ? `?${qs}` : ""}`);
+  },
+  checkout: (payload) =>
+    request("/loans/", { method: "POST", body: JSON.stringify(payload) }),
+  postLoanEvent: (loanId, payload) =>
+    request(`/loans/${loanId}/events/`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
 };

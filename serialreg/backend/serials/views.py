@@ -3,13 +3,15 @@ from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
 
+from .circulation import CirculationError, apply_event, checkout_item
 from .models import (
-    Binding, Issue, IssueNumber, IssueNumbering, Item, Title,
-    locate_number, number_holding_status,
+    Binding, Issue, IssueNumber, IssueNumbering, Item, Loan, Title,
+    circulation_info, locate_number, number_holding_status, open_loan_prefetch,
 )
 from .serializers import (
-    BindingSerializer, IssueSerializer, ItemSerializer,
-    IssueNumberSerializer, TitleSerializer, UnbindSerializer,
+    BindingSerializer, CheckoutSerializer, CirculationEventSerializer,
+    IssueSerializer, ItemSerializer, IssueNumberSerializer, LoanEventSerializer,
+    LoanSerializer, TitleSerializer, UnbindSerializer,
 )
 
 
@@ -47,14 +49,15 @@ class IssueViewSet(viewsets.ModelViewSet):
 class ItemViewSet(viewsets.ModelViewSet):
     queryset = Item.objects.select_related(
         "title", "issue", "binding_entry__binding",
-    ).prefetch_related("issue__numbers")
+    ).prefetch_related("issue__numbers", open_loan_prefetch())
     serializer_class = ItemSerializer
 
     @action(detail=False, methods=["get"])
     def locate(self, request):
         """按 (title, volume, number) 或 barcode 定位实物。
 
-        合刊的任一期号都必须能找到同一实物；装订后返回装订册位置。
+        合刊的任一期号都必须能找到同一实物；装订后返回装订册位置，
+        借出中返回流通保管位置、到期日与逾期标记。
         """
         title_id = request.query_params.get("title")
         volume = request.query_params.get("volume", "")
@@ -77,6 +80,8 @@ class ItemViewSet(viewsets.ModelViewSet):
                     "binding": it.binding_entry.binding.call_number
                     if it.is_bound else None,
                     "status": it.status,
+                    "availability": it.availability(),
+                    "circulation": circulation_info(it),
                 })
             return Response({"query": {"barcode": barcode}, "matches": result})
 
@@ -141,6 +146,104 @@ class BindingViewSet(viewsets.ModelViewSet):
         })
 
 
+class LoanViewSet(viewsets.GenericViewSet):
+    """本地流通单据：开单（借出）、追加事件（归还/逾期/遗失）、查询事件链。
+
+    所有写操作都幂等：同一 idempotency_key 重放返回原结果，不重复改变状态。
+    """
+
+    queryset = Loan.objects.select_related(
+        "item", "item__title",
+    ).prefetch_related("events")
+    serializer_class = LoanSerializer
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        params = self.request.query_params
+        if params.get("title"):
+            qs = qs.filter(item__title_id=params["title"])
+        if params.get("item"):
+            qs = qs.filter(item_id=params["item"])
+        if params.get("barcode"):
+            qs = qs.filter(item__barcode=params["barcode"])
+        if params.get("status"):
+            qs = qs.filter(status=params["status"])
+        return qs
+
+    def list(self, request):
+        return Response(self.get_serializer(self.get_queryset(), many=True).data)
+
+    def retrieve(self, request, pk=None):
+        return Response(self.get_serializer(self.get_object()).data)
+
+    def create(self, request):
+        """开单借出。同一 idempotency_key 重放 → 200 返回原单据。"""
+        serializer = CheckoutSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        try:
+            loan, replayed = checkout_item(
+                item=data["item"],
+                idempotency_key=data["idempotency_key"],
+                due_date=data["due_date"],
+                custody_location=data.get("custody_location", ""),
+                occurred_at=data.get("occurred_at"),
+            )
+        except CirculationError as e:
+            return Response(
+                {"detail": str(e)},
+                status=self._error_status(e),
+            )
+        body = LoanSerializer(loan).data
+        body["replayed"] = replayed
+        return Response(
+            body,
+            status=status.HTTP_200_OK if replayed else status.HTTP_201_CREATED,
+        )
+
+    @action(detail=True, methods=["get", "post"])
+    def events(self, request, pk=None):
+        """GET 查看事件链；POST 追加归还/逾期/遗失事件。
+
+        迟到事件（occurred_at 早于最近已应用事件）记录为 applied=False，
+        不覆盖较新的处置；重放同一 idempotency_key 不产生第二条事件。
+        """
+        loan = self.get_object()
+        if request.method == "GET":
+            return Response(
+                CirculationEventSerializer(loan.events.all(), many=True).data,
+            )
+        serializer = LoanEventSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        try:
+            event, replayed = apply_event(
+                loan_id=loan.pk,
+                event_type=data["event_type"],
+                idempotency_key=data["idempotency_key"],
+                occurred_at=data.get("occurred_at"),
+                note=data.get("note", ""),
+            )
+        except CirculationError as e:
+            return Response(
+                {"detail": str(e)},
+                status=self._error_status(e),
+            )
+        return Response({
+            "event": CirculationEventSerializer(event).data,
+            "loan": LoanSerializer(loan.__class__.objects
+                                   .prefetch_related("events")
+                                   .get(pk=loan.pk)).data,
+            "replayed": replayed,
+        }, status=status.HTTP_200_OK if replayed else status.HTTP_201_CREATED)
+
+    @staticmethod
+    def _error_status(exc):
+        if exc.code == "conflict":
+            return status.HTTP_409_CONFLICT
+        return status.HTTP_400_BAD_REQUEST
+
+
 class TimelineViewSet(viewsets.ViewSet):
     """前端时间轴数据源：编号 × 发行 × 实物三层，外加停刊标记。"""
 
@@ -166,7 +269,7 @@ class TimelineViewSet(viewsets.ViewSet):
                             "items",
                             queryset=Item.objects.select_related(
                                 "binding_entry__binding",
-                            ),
+                            ).prefetch_related(open_loan_prefetch()),
                         ),
                     ),
                 ),
@@ -201,10 +304,12 @@ class TimelineViewSet(viewsets.ViewSet):
                                 "item_id": it.id,
                                 "barcode": it.barcode,
                                 "status": it.status,
+                                "availability": it.availability(),
                                 "location": it.current_location(),
                                 "bound": it.is_bound,
                                 "binding": it.binding_entry.binding.call_number
                                 if it.is_bound else None,
+                                "circulation": circulation_info(it),
                             }
                             for it in iss.items.all()
                         ],

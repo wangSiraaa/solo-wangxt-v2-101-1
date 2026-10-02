@@ -56,15 +56,20 @@
 
             <div v-for="it in iss.items" :key="it.barcode" class="item-line">
               <code>{{ it.barcode }}</code>
-              <span class="badge" :class="it.status === 'lost' ? 'missing' : 'ok'">
-                {{ itemStatus[it.status] || it.status }}
+              <span class="badge" :class="availMeta(it).cls">
+                {{ availMeta(it).label }}
               </span>
+              <span v-if="it.circulation?.overdue" class="badge missing">已逾期</span>
               <span class="loc">
                 📍 {{ it.location || "（未排架）" }}
                 <template v-if="it.bound">（装订册 {{ it.binding }}）</template>
+                <template v-else-if="it.circulation">
+                  （流通单 #{{ it.circulation.loan_id }} · 到期
+                  {{ it.circulation.due_date }}）
+                </template>
               </span>
               <button
-                v-if="!it.bound && it.status !== 'lost'"
+                v-if="it.availability === 'available'"
                 class="tiny ghost"
                 @click="$emit('mark-lost', it.item_id)"
                 title="标记丢失后，该期变为缺藏"
@@ -78,13 +83,17 @@
 </template>
 
 <script setup>
-import { HOLDING_STATUS, ITEM_STATUS } from "../status.js";
+import { AVAILABILITY, HOLDING_STATUS } from "../status.js";
 
 defineProps({ data: Object });
 defineEmits(["mark-lost"]);
-const itemStatus = ITEM_STATUS;
 
 const isGap = (s) => s === "not_published" || s === "ceased_gap";
+
+// 实际可得性徽标：可借 / 借出中 / 已装订 / 丢失
+function availMeta(it) {
+  return AVAILABILITY[it.availability] || { label: it.availability, cls: "gap" };
+}
 
 function statusMeta(s) {
   return HOLDING_STATUS[s] || { label: s, cls: "gap", hint: "" };

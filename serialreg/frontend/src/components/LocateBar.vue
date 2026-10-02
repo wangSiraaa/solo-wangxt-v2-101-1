@@ -32,12 +32,16 @@
       </p>
       <div v-for="(m, i) in result.matches" :key="i" class="item-line">
         <code>{{ m.barcode }}</code>
-        <span class="badge" :class="m.status === 'lost' ? 'missing' : 'ok'">
-          {{ itemStatus[m.status] || m.status }}
-        </span>
+        <span class="badge" :class="availMeta(m).cls">{{ availMeta(m).label }}</span>
+        <span v-if="m.circulation?.overdue" class="badge missing">已逾期</span>
         <span class="loc">
           📍 {{ m.location || "（未排架）" }}
           <template v-if="m.bound">（装订册 {{ m.binding }}）</template>
+          <template v-else-if="m.circulation">
+            （流通单 #{{ m.circulation.loan_id }} · 到期
+            {{ m.circulation.due_date }} · 保管于
+            {{ m.circulation.custody_location }}）
+          </template>
         </span>
       </div>
     </div>
@@ -47,7 +51,7 @@
 <script setup>
 import { ref } from "vue";
 import { api } from "../api.js";
-import { HOLDING_STATUS, ITEM_STATUS } from "../status.js";
+import { AVAILABILITY, HOLDING_STATUS } from "../status.js";
 
 const props = defineProps({ titleId: [Number, String] });
 
@@ -56,12 +60,14 @@ const number = ref("");
 const barcode = ref("");
 const result = ref(null);
 const error = ref("");
-const itemStatus = ITEM_STATUS;
 
 function meta(s) {
   return HOLDING_STATUS[s] || { label: s || "未登记", cls: "gap", hint: "" };
 }
 const badgeCls = (s) => meta(s).cls;
+function availMeta(m) {
+  return AVAILABILITY[m.availability] || { label: m.availability, cls: "gap" };
+}
 
 async function byNumber() {
   error.value = "";

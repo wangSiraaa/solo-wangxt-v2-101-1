@@ -12,6 +12,7 @@
 | 发行 | `Issue` + `IssueNumbering` | 一次出版行为。普通期关联 1 个编号，**两期合刊关联 ≥2 个独立编号记录** |
 | 实体 | `Item` | 一条条码 = 一个实物，指向一个 `Issue`，多期号覆盖由关联表表达 |
 | 装订 | `Binding` + `BindingEntry` | 多个实物订成一册，记录装订后位置并封存各实物原位置 |
+| 流通 | `Loan` + `CirculationEvent` | 本地流通单据及其事件链（借出/归还/逾期/遗失），幂等且按发生顺序应用 |
 
 关键业务规则：
 
@@ -25,6 +26,24 @@
 - **装订**：实物条码与多期号关系不变，实际位置改指向装订册；
   **拆订**后按封存的 `previous_location` 恢复各自位置，合刊编号关系依旧完整。
 - 禁止跨刊混装、重复装订；`status=bound` 只能由装订/拆订流程设置。
+
+## 本地流通（借出 / 归还 / 逾期 / 遗失）
+
+- **可借条件**：只有「未装订且在馆」的实体可开单借出；借出中的实体**不能再借、
+  不能被装订**；已装订实体**不能拆成单件外借**（须先拆订）。
+- **单据与事件链**：一次借出 = 一张 `Loan`（含到期日、借出保管位置）；
+  每次状态变化 = 一条 `CirculationEvent`（checkout/return/overdue/lost），
+  持久化保存完整审计历史，重启不丢。
+- **幂等**：开单与每个事件都带 `idempotency_key`；同一标识重放命中原记录
+  （HTTP 200 + `replayed: true`），不会重复开单或重复归还。
+- **发生顺序**：事件按 `occurred_at`（业务发生时间）应用，单据内序号 `seq` 单调递增。
+  **迟到事件**（发生时间早于最近已应用事件）只写入审计链（`applied=false`），
+  不覆盖较新的处置——例如逾期之后收到的「更早的遗失」不会改变在借状态。
+- **定位联动**：借出期间 `Item.location`（馆藏位置）不被改动，定位接口与时间轴
+  显示的是**实际保管位置**（流通台等）、到期日与逾期标记；归还后自动回到原位置。
+  合刊实物从任一覆盖期号或条码检索，看到的都是**同一张借出单**。
+- 有未关闭流通单的实物禁止直接 PATCH 状态（报失须走「遗失」事件），
+  保证事件链是唯一事实来源；缺号/缺藏的判定语义不受影响。
 
 ## 技术栈
 
@@ -42,7 +61,8 @@ docker compose up --build
 # 前端 http://localhost:5173   后端 http://localhost:8000/api/
 ```
 
-后端容器启动时自动 `migrate` 并执行 `seed_sample`（跨年卷 / 停刊 / 两期合刊 + 装订样例）。
+后端容器启动时自动 `migrate` 并执行 `seed_sample`（跨年卷 / 停刊 / 两期合刊 + 装订 +
+一笔在借流通单样例）。
 
 ### 本地分别启动
 
@@ -68,10 +88,13 @@ SERIALREG_DB=postgres pytest -q
 SERIALREG_DB=sqlite pytest -q
 ```
 
-15 条测试覆盖：跨年卷单编号跨两年、停刊必须填月份、缺号(`ceased_gap`/`not_published`)
+23 条测试覆盖：跨年卷单编号跨两年、停刊必须填月份、缺号(`ceased_gap`/`not_published`)
 不等于缺藏(`issued+missing`)、合刊保留两条编号关联、任一期号可定位、条码反查得到两个期号、
 装订后从 no.3/no.4/no.5 均指向装订册、禁止跨刊混装与重复装订、拆订恢复原位置且关系完好、
-合刊实物在两个槽位下重复提交装订时自动去重。
+合刊实物在两个槽位下重复提交装订时自动去重，以及流通验收：
+**合刊借出后两个期号与条码显示同一借出单与到期日、归还重放只产生一次归还且原位置恢复、
+借出中装订与已装订单件借出均被拒且关系不变、逾期后迟到遗失事件不覆盖较新处置
+（重启后状态与完整事件链保持）、借出中禁止直接改状态。**
 
 手工端到端（样例数据）：
 
@@ -80,6 +103,12 @@ SERIALREG_DB=sqlite pytest -q
 curl "/api/items/locate/?title=3&volume=8&number=4"
 # 拆订 → 恢复「现刊区 B-02」
 curl -X POST /api/bindings/unbind/ -H "Content-Type: application/json" -d '{"binding_id":1}'
+# 借出（幂等键去重，重放返回同一单）
+curl -X POST /api/loans/ -H "Content-Type: application/json" \
+  -d '{"barcode":"NJ-60-3","due_date":"2026-11-01","idempotency_key":"demo-ck-1"}'
+# 归还（重放同一幂等键不会产生第二个归还事件）
+curl -X POST /api/loans/1/events/ -H "Content-Type: application/json" \
+  -d '{"event_type":"return","idempotency_key":"demo-ret-1"}'
 ```
 
 ## 主要 API
@@ -90,17 +119,24 @@ curl -X POST /api/bindings/unbind/ -H "Content-Type: application/json" -d '{"bin
 | `GET/POST /api/numbers/` | 卷期编号槽位 |
 | `GET/POST /api/issues/` | 发行期；`kind=combined` 时 `number_ids` 至少 2 个 |
 | `GET/POST /api/items/` | 入藏实物（条码+发行期+位置） |
-| `GET /api/items/locate/?title=&volume=&number=` | 按期号定位实物/位置（缺号返回空匹配+状态） |
-| `GET /api/items/locate/?barcode=` | 按条码反查（含合刊覆盖的全部期号） |
-| `GET/POST /api/bindings/` | 装订（同刊、未装订实物） |
+| `GET /api/items/locate/?title=&volume=&number=` | 按期号定位实物/位置（缺号返回空匹配+状态；借出中返回流通单、到期日、保管位置） |
+| `GET /api/items/locate/?barcode=` | 按条码反查（含合刊覆盖的全部期号与流通状态） |
+| `GET/POST /api/bindings/` | 装订（同刊、未装订且在馆实物；借出中拒绝） |
 | `POST /api/bindings/unbind/` | 拆订，恢复各自位置 |
-| `GET /api/timeline/?title=` | 时间轴：编号槽位×发行×实物×停刊标记 |
+| `GET/POST /api/loans/` | 流通单列表 / 开单借出（`idempotency_key` 幂等） |
+| `GET /api/loans/{id}/` | 单据详情 + 完整事件链 |
+| `GET/POST /api/loans/{id}/events/` | 事件链 / 追加归还·逾期·遗失事件（幂等；迟到事件 `applied=false` 留痕不覆盖） |
+| `GET /api/timeline/?title=` | 时间轴：编号槽位×发行×实物×流通状态×停刊标记 |
 
 ## 界面
 
 - 左侧刊种列表（含停刊月份徽标）与新增刊种；
 - **时间轴**：每个卷期一个节点，区分「已入藏 / 缺藏 / 缺号 / 停刊后缺号」，
-  展开显示发行年月区间、合刊徽标、实物条码与实际位置（装订后显示装订册）；
-- 定位栏：按期号（合刊任一期号）或条码检索；
+  展开显示发行年月区间、合刊徽标、实物条码与实际位置（装订后显示装订册，
+  借出中显示流通单号、到期日与逾期徽标）；
+- 定位栏：按期号（合刊任一期号）或条码检索，显示实际可得性与到期日；
+- **流通面板**：开单借出（自动生成本次幂等标识，可查看）、在借单据的
+  归还/逾期/遗失操作、已关闭单据的事件链时间线（迟到事件标注「未应用」）；
 - 登记操作：编号槽位 → 发行期（普通/合刊，年月与编号分录）→ 入藏；
-- 装订面板：勾选同刊未装订实物建装订册，一键拆订并显示各实物原位置。
+- 装订面板：勾选同刊未装订且在馆实物建装订册，一键拆订并显示各实物原位置。
+

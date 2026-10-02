@@ -59,6 +59,11 @@
             <TimelineView :data="timeline" @mark-lost="markLost" />
           </div>
           <div style="flex:1;min-width:340px">
+            <CirculationPanel
+              :title-id="currentId"
+              :timeline="timeline"
+              @changed="refresh"
+            />
             <RegisterForms
               :title-id="currentId"
               :timeline="timeline"
@@ -84,6 +89,7 @@ import TimelineView from "./components/TimelineView.vue";
 import LocateBar from "./components/LocateBar.vue";
 import RegisterForms from "./components/RegisterForms.vue";
 import BindingPanel from "./components/BindingPanel.vue";
+import CirculationPanel from "./components/CirculationPanel.vue";
 
 const titles = ref([]);
 const currentId = ref(null);

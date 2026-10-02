@@ -15,6 +15,8 @@
   --ceased-bg: #eef0f3;
   --combined: #6d3fb0;
   --combined-bg: #f1e9fb;
+  --loaned: #1d6fb8;
+  --loaned-bg: #e5f1fb;
 }
 
 * { box-sizing: border-box; }
@@ -104,6 +106,7 @@ button.tiny { padding: 3px 9px; font-size: 12px; }
 .badge.gap { background: var(--gap-bg); color: var(--gap); }
 .badge.ceased { background: var(--ceased-bg); color: var(--ceased); }
 .badge.combined { background: var(--combined-bg); color: var(--combined); }
+.badge.loaned { background: var(--loaned-bg); color: var(--loaned); }
 
 .msg { font-size: 13px; margin-top: 8px; }
 .msg.err { color: var(--missing); }
@@ -162,6 +165,27 @@ button.tiny { padding: 3px 9px; font-size: 12px; }
   border-radius: 8px; padding: 8px 12px; margin-bottom: 8px;
   background: #faf7ff;
 }
+
+/* 流通单据 */
+.loan-card {
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--loaned);
+  border-radius: 8px; padding: 8px 12px; margin-bottom: 8px;
+  background: #f8fbff;
+}
+.loan-card.closed { border-left-color: var(--ceased); background: #fafbfc; }
+.event-chain {
+  margin: 8px 0 2px; padding-left: 4px;
+  list-style: none; font-size: 12px;
+  border-top: 1px dashed var(--line); padding-top: 6px;
+}
+.event-chain li { display: flex; gap: 8px; align-items: center; padding: 2px 0; flex-wrap: wrap; }
+.event-chain li .seq {
+  font-family: monospace; color: var(--muted);
+  background: #eef1f5; border-radius: 4px; padding: 0 5px;
+}
+.event-chain li.stale { color: var(--muted); }
+.event-chain li.stale b { text-decoration: line-through; }
 .checks label { display: inline-flex; gap: 4px; align-items: center; margin-right: 12px; font-size: 13px; }
 .muted { color: var(--muted); font-size: 12px; }
 .locate-result {
